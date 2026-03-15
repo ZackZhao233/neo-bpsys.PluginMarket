@@ -510,15 +510,13 @@ jobs:
                                           
                                           if status == 'safe':
                                               safe_engines += 1
-                                          elif status in ['malicious', 'suspicious']:
+                                          else:
                                               unsafe_engines += 1
                                               engine_details.append({
                                                   'engine': engine_name,
                                                   'result': engine_data.get('result', 'unknown'),
                                                   'detail': engine_data.get('detail', '')
                                               })
-                                          else:
-                                              failed_engines += 1
                                       elif isinstance(engine_data, str):
                                           status = engine_data.lower()
                                           total_engines += 1
@@ -681,7 +679,6 @@ jobs:
             
             - 扫描引擎总数 / Total Engines: ${r.total_engines}
             - 安全引擎数 / Safe Engines: ${r.safe_engines}
-            - 风险引擎数 / Unsafe Engines: ${r.unsafe_engines}
             
             **风险详情 / Risk Details:**
             ${r.risk_details}
