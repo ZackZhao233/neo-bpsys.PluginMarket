@@ -1,0 +1,820 @@
+name: PR Security Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "PluginManifests/**/*.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  THREATBOOK_API_BASE: "https://api.threatbook.cn/v3"
+  MAX_RETRY: 3
+  RETRY_DELAY: 10
+  SCAN_TIMEOUT: 600
+  MIN_ENGINES_FOR_PASS: 20
+
+jobs:
+  security-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml requests
+
+      - name: Get changed manifest files
+        id: changed-files
+        run: |
+          echo "Fetching changed files..."
+          git fetch origin main
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD -- 'PluginManifests/*.yml' | tr '\n' ' ')
+          echo "changed_files=${CHANGED_FILES}" >> "$GITHUB_OUTPUT"
+          echo "Changed files: ${CHANGED_FILES}"
+
+      - name: Validate manifest compliance
+        id: compliance-check
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import yaml
+          import os
+          import sys
+          import re
+
+          def validate_manifest(file_path, all_existing_ids):
+              errors = []
+              
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+              except Exception as e:
+                  return [f"Cannot read file: {str(e)}"]
+
+              lines = content.split('\n')
+              for i, line in enumerate(lines, 1):
+                  stripped = line.strip()
+                  if stripped.startswith('#'):
+                      continue
+                  if stripped and ':' not in stripped:
+                      errors.append(f"Line {i}: Invalid format - must be 'key: value' structure")
+                  if stripped and ':' in stripped:
+                      if stripped.count(':') > 1 and not stripped.startswith('"') and not stripped.startswith("'"):
+                          if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*:\s*.+$', stripped):
+                              errors.append(f"Line {i}: Nested objects or arrays are not supported")
+
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      manifest = yaml.safe_load(f)
+              except yaml.YAMLError as e:
+                  return [f"YAML parsing error: {str(e)}"]
+
+              if manifest is None:
+                  return ["Empty manifest file"]
+
+              if not isinstance(manifest, dict):
+                  return ["Manifest must be a flat key-value structure"]
+
+              for key, value in manifest.items():
+                  if isinstance(value, (list, dict)):
+                      errors.append(f"Field '{key}': Nested objects or arrays are not supported")
+
+              if 'id' not in manifest:
+                  errors.append("Missing required field: 'id'")
+              elif not manifest['id'] or str(manifest['id']).strip() == '':
+                  errors.append("Field 'id' must be non-empty")
+              elif str(manifest['id']) in all_existing_ids:
+                  errors.append(f"Duplicate id: '{manifest['id']}' already exists in the repository")
+
+              required_fields = ['name', 'description', 'version', 'apiVersion', 'author', 'downloadURL']
+              for field in required_fields:
+                  if field not in manifest:
+                      errors.append(f"Missing recommended field: '{field}'")
+
+              return errors
+
+          changed_files_str = os.environ.get('CHANGED_FILES', '').strip()
+          if not changed_files_str:
+              print("No manifest files changed.")
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write("passed=true\n")
+                  f.write("errors=\n")
+              sys.exit(0)
+
+          changed_files = changed_files_str.split()
+
+          git fetch_result = os.system('git fetch origin main 2>/dev/null')
+          os.system('git checkout origin/main -- PluginManifests/ 2>/dev/null || true')
+          os.system('git checkout HEAD -- PluginManifests/ 2>/dev/null || true')
+
+          existing_ids = set()
+          for root, dirs, files in os.walk('PluginManifests'):
+              for file in files:
+                  if file.endswith('.yml'):
+                      file_path = os.path.join(root, file)
+                      is_changed = any(f.endswith(file) for f in changed_files)
+                      if is_changed:
+                          continue
+                      try:
+                          with open(file_path, 'r', encoding='utf-8') as f:
+                              data = yaml.safe_load(f)
+                              if data and 'id' in data:
+                                  existing_ids.add(str(data['id']))
+                      except:
+                          pass
+
+          all_errors = []
+          valid_files = []
+          
+          for file in changed_files:
+              if os.path.exists(file):
+                  errors = validate_manifest(file, existing_ids)
+                  if errors:
+                      all_errors.append(f"**{file}:**\n- " + "\n- ".join(errors))
+                  else:
+                      valid_files.append(file)
+                      try:
+                          with open(file, 'r', encoding='utf-8') as f:
+                              data = yaml.safe_load(f)
+                              if data and 'id' in data:
+                                  existing_ids.add(str(data['id']))
+                      except:
+                          pass
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              if all_errors:
+                  f.write("passed=false\n")
+                  f.write("errors<<EOF\n")
+                  f.write("\n\n".join(all_errors) + "\n")
+                  f.write("EOF\n")
+              else:
+                  f.write("passed=true\n")
+                  f.write("errors=\n")
+
+          if all_errors:
+              print("Compliance check failed:")
+              for err in all_errors:
+                  print(err)
+              sys.exit(0)
+          else:
+              print("Compliance check passed!")
+              sys.exit(0)
+          PYTHON_SCRIPT
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+
+      - name: Post compliance error comment
+        if: steps.compliance-check.outputs.passed == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errors = `${{ steps.compliance-check.outputs.errors }}`;
+            const comment = `## ❌ 清单合规性检查失败 / Manifest Compliance Check Failed
+            
+            您的Pull Request未通过清单合规性检查，请根据以下问题进行修改：
+
+            Your Pull Request failed the manifest compliance check. Please fix the following issues:
+
+            ---
+
+            ${errors}
+
+            ---
+
+            ### 📋 清单要求 / Manifest Requirements:
+            - 清单文件放在 \`PluginManifests/\` 目录
+            - 文件名建议使用 \`<PluginId>.yml\`
+            - 只支持扁平的 \`key: value\` 结构，不支持嵌套对象或数组
+            - 每个清单必须包含非空且唯一的 \`id\`
+            - 建议包含: \`name\`, \`description\`, \`version\`, \`apiVersion\`, \`author\`, \`downloadURL\`
+
+            请修改后重新提交。修改完成后，此工作流将自动重新运行。
+            `;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+      - name: Exit if compliance check failed
+        if: steps.compliance-check.outputs.passed == 'false'
+        run: exit 1
+
+      - name: Create download directory
+        if: steps.compliance-check.outputs.passed == 'true'
+        run: |
+          mkdir -p ./tmp/downloads
+
+      - name: Download files from manifests
+        if: steps.compliance-check.outputs.passed == 'true'
+        id: download-files
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import yaml
+          import os
+          import subprocess
+          import sys
+          import hashlib
+
+          changed_files_str = os.environ.get('CHANGED_FILES', '').strip()
+          if not changed_files_str:
+              print("No files to download.")
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write("success=true\n")
+                  f.write("download_info=\n")
+              sys.exit(0)
+
+          changed_files = changed_files_str.split()
+          download_dir = "./tmp/downloads"
+          os.makedirs(download_dir, exist_ok=True)
+
+          download_info = []
+          failed = False
+
+          for file in changed_files:
+              if not os.path.exists(file):
+                  continue
+              
+              try:
+                  with open(file, 'r', encoding='utf-8') as f:
+                      manifest = yaml.safe_load(f)
+              except Exception as e:
+                  print(f"Error reading {file}: {e}")
+                  continue
+
+              if not manifest or 'downloadURL' not in manifest:
+                  continue
+
+              download_url = manifest['downloadURL']
+              plugin_id = manifest.get('id', 'unknown')
+              plugin_name = manifest.get('name', plugin_id)
+
+              print(f"Downloading: {download_url}")
+              
+              file_path = os.path.join(download_dir, f"{plugin_id}.zip")
+              
+              for attempt in range(3):
+                  try:
+                      result = subprocess.run(
+                          ['curl', '-L', '-o', file_path, '--connect-timeout', '60', '--max-time', '300', download_url],
+                          capture_output=True,
+                          text=True,
+                          timeout=360
+                      )
+                      
+                      if result.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                          sha256_hash = hashlib.sha256()
+                          with open(file_path, 'rb') as f:
+                              for chunk in iter(lambda: f.read(4096), b''):
+                                  sha256_hash.update(chunk)
+                          sha256 = sha256_hash.hexdigest()
+                          
+                          download_info.append({
+                              'plugin_id': plugin_id,
+                              'plugin_name': plugin_name,
+                              'file_path': file_path,
+                              'sha256': sha256,
+                              'url': download_url
+                          })
+                          print(f"Successfully downloaded: {file_path} (SHA256: {sha256})")
+                          break
+                      else:
+                          print(f"Download attempt {attempt + 1} failed for {download_url}")
+                          if attempt < 2:
+                              import time
+                              time.sleep(5)
+                  except subprocess.TimeoutExpired:
+                      print(f"Download timeout for {download_url}, attempt {attempt + 1}")
+                      if attempt < 2:
+                          import time
+                          time.sleep(5)
+                  except Exception as e:
+                      print(f"Download error for {download_url}: {e}, attempt {attempt + 1}")
+                      if attempt < 2:
+                          import time
+                          time.sleep(5)
+              else:
+                  print(f"Failed to download {download_url} after 3 attempts")
+                  failed = True
+
+          import json
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              if failed:
+                  f.write("success=false\n")
+              else:
+                  f.write("success=true\n")
+              f.write("download_info<<EOF\n")
+              f.write(json.dumps(download_info) + "\n")
+              f.write("EOF\n")
+
+          if failed:
+              sys.exit(1)
+          PYTHON_SCRIPT
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+
+      - name: Upload files to ThreatBook Sandbox
+        if: steps.download-files.outputs.success == 'true'
+        id: upload-sandbox
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import requests
+          import os
+          import json
+          import time
+          import sys
+
+          download_info_str = os.environ.get('DOWNLOAD_INFO', '[]')
+          download_info = json.loads(download_info_str) if download_info_str else []
+
+          if not download_info:
+              print("No files to upload.")
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write("success=true\n")
+                  f.write("upload_info=\n")
+              sys.exit(0)
+
+          api_key = os.environ.get('THREAT_BOOK_API_KEY')
+          if not api_key:
+              print("Error: THREAT_BOOK_API_KEY not set")
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write("success=false\n")
+                  f.write("error=THREAT_BOOK_API_KEY not configured\n")
+              sys.exit(1)
+
+          upload_results = []
+          failed = False
+
+          for info in download_info:
+              file_path = info['file_path']
+              plugin_id = info['plugin_id']
+              
+              print(f"Uploading {file_path} to ThreatBook...")
+              
+              for attempt in range(3):
+                  try:
+                      with open(file_path, 'rb') as f:
+                          files = {'file': (os.path.basename(file_path), f)}
+                          data = {
+                              'apikey': api_key,
+                              'sandbox_type': 'win10_1903_enx64_office2016',
+                              'runtime': 280
+                          }
+                          
+                          response = requests.post(
+                              'https://api.threatbook.cn/v3/file/upload',
+                              data=data,
+                              files=files,
+                              timeout=120
+                          )
+                          
+                          result = response.json()
+                          
+                          if result.get('response_code') == 0 or result.get('data'):
+                              sha256 = info['sha256']
+                              permalink = result.get('data', {}).get('permalink', '')
+                              
+                              upload_results.append({
+                                  'plugin_id': plugin_id,
+                                  'plugin_name': info['plugin_name'],
+                                  'sha256': sha256,
+                                  'permalink': permalink
+                              })
+                              print(f"Successfully uploaded {plugin_id}, SHA256: {sha256}")
+                              break
+                          else:
+                              error_msg = result.get('verbose_msg', 'Unknown error')
+                              print(f"Upload attempt {attempt + 1} failed: {error_msg}")
+                              if attempt < 2:
+                                  time.sleep(10)
+                  except requests.exceptions.Timeout:
+                      print(f"Upload timeout for {plugin_id}, attempt {attempt + 1}")
+                      if attempt < 2:
+                          time.sleep(10)
+                  except Exception as e:
+                      print(f"Upload error for {plugin_id}: {e}, attempt {attempt + 1}")
+                      if attempt < 2:
+                          time.sleep(10)
+              else:
+                  print(f"Failed to upload {plugin_id} after 3 attempts")
+                  failed = True
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              if failed:
+                  f.write("success=false\n")
+              else:
+                  f.write("success=true\n")
+              f.write("upload_info<<EOF\n")
+              f.write(json.dumps(upload_results) + "\n")
+              f.write("EOF\n")
+
+          if failed:
+              sys.exit(1)
+          PYTHON_SCRIPT
+        env:
+          DOWNLOAD_INFO: ${{ steps.download-files.outputs.download_info }}
+          THREAT_BOOK_API_KEY: ${{ secrets.THREAT_BOOK_API_KEY }}
+
+      - name: Wait for scan completion and get results
+        if: steps.upload-sandbox.outputs.success == 'true'
+        id: scan-results
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import requests
+          import os
+          import json
+          import time
+          import sys
+
+          upload_info_str = os.environ.get('UPLOAD_INFO', '[]')
+          upload_info = json.loads(upload_info_str) if upload_info_str else []
+
+          if not upload_info:
+              print("No files to scan.")
+              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+                  f.write("success=true\n")
+                  f.write("scan_results=\n")
+              sys.exit(0)
+
+          api_key = os.environ.get('THREAT_BOOK_API_KEY')
+          timeout = int(os.environ.get('SCAN_TIMEOUT', '600'))
+          min_engines = int(os.environ.get('MIN_ENGINES_FOR_PASS', '20'))
+
+          scan_results = []
+          failed = False
+
+          for info in upload_info:
+              sha256 = info['sha256']
+              plugin_id = info['plugin_id']
+              
+              print(f"Waiting for scan results for {plugin_id} (SHA256: {sha256})...")
+              
+              start_time = time.time()
+              scan_complete = False
+              multiengines_result = None
+              
+              while time.time() - start_time < timeout:
+                  for attempt in range(3):
+                      try:
+                          response = requests.get(
+                              'https://api.threatbook.cn/v3/file/report/multiengines',
+                              params={
+                                  'apikey': api_key,
+                                  'sha256': sha256
+                              },
+                              timeout=60
+                          )
+                          
+                          result = response.json()
+                          
+                          if result.get('response_code') == 0:
+                              data = result.get('data', {})
+                              multiengines = data.get('multiengines', {})
+                              
+                              if multiengines:
+                                  total_engines = 0
+                                  safe_engines = 0
+                                  unsafe_engines = 0
+                                  failed_engines = 0
+                                  engine_details = []
+                                  
+                                  for engine_name, engine_data in multiengines.items():
+                                      if isinstance(engine_data, dict):
+                                          status = engine_data.get('result', '').lower()
+                                          total_engines += 1
+                                          
+                                          if status == 'safe':
+                                              safe_engines += 1
+                                          elif status in ['malicious', 'suspicious']:
+                                              unsafe_engines += 1
+                                              engine_details.append({
+                                                  'engine': engine_name,
+                                                  'result': engine_data.get('result', 'unknown'),
+                                                  'detail': engine_data.get('detail', '')
+                                              })
+                                          else:
+                                              failed_engines += 1
+                                  
+                                  if total_engines > 0:
+                                      scan_complete = True
+                                      multiengines_result = {
+                                          'plugin_id': plugin_id,
+                                          'plugin_name': info['plugin_name'],
+                                          'sha256': sha256,
+                                          'permalink': info['permalink'],
+                                          'total_engines': total_engines,
+                                          'safe_engines': safe_engines,
+                                          'unsafe_engines': unsafe_engines,
+                                          'failed_engines': failed_engines,
+                                          'engine_details': engine_details,
+                                          'all_safe': unsafe_engines == 0,
+                                          'enough_engines': total_engines >= min_engines
+                                      }
+                                      break
+                          
+                          break
+                      except Exception as e:
+                          print(f"Query attempt {attempt + 1} failed: {e}")
+                          if attempt < 2:
+                              time.sleep(5)
+                  
+                  if scan_complete:
+                      break
+                  
+                  time.sleep(30)
+              
+              if scan_complete and multiengines_result:
+                  scan_results.append(multiengines_result)
+                  print(f"Scan complete for {plugin_id}: {multiengines_result['safe_engines']}/{multiengines_result['total_engines']} safe")
+              else:
+                  print(f"Scan timeout for {plugin_id}")
+                  failed = True
+                  scan_results.append({
+                      'plugin_id': plugin_id,
+                      'plugin_name': info['plugin_name'],
+                      'sha256': sha256,
+                      'permalink': info['permalink'],
+                      'error': 'Scan timeout or failed'
+                  })
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
+              if failed:
+                  f.write("success=false\n")
+              else:
+                  f.write("success=true\n")
+              f.write("scan_results<<EOF\n")
+              f.write(json.dumps(scan_results) + "\n")
+              f.write("EOF\n")
+
+          if failed:
+              sys.exit(1)
+          PYTHON_SCRIPT
+        env:
+          UPLOAD_INFO: ${{ steps.upload-sandbox.outputs.upload_info }}
+          THREAT_BOOK_API_KEY: ${{ secrets.THREAT_BOOK_API_KEY }}
+          SCAN_TIMEOUT: ${{ env.SCAN_TIMEOUT }}
+          MIN_ENGINES_FOR_PASS: ${{ env.MIN_ENGINES_FOR_PASS }}
+
+      - name: Process scan results and post comment
+        if: steps.scan-results.outputs.success == 'true' || steps.scan-results.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const scanResultsStr = `${{ steps.scan-results.outputs.scan_results }}`;
+            let scanResults = [];
+            try {
+              scanResults = JSON.parse(scanResultsStr || '[]');
+            } catch (e) {
+              console.log('Failed to parse scan results');
+            }
+
+            let allPassed = true;
+            let needsReview = false;
+            let hasRisk = false;
+            const reportDetails = [];
+
+            for (const result of scanResults) {
+              if (result.error) {
+                needsReview = true;
+                reportDetails.push({
+                  plugin_id: result.plugin_id,
+                  status: 'error',
+                  message: result.error,
+                  report_url: `https://s.threatbook.com/report/file/${result.sha256}`
+                });
+                continue;
+              }
+
+              const reportUrl = `https://s.threatbook.com/report/file/${result.sha256}`;
+              
+              if (!result.all_safe) {
+                hasRisk = true;
+                allPassed = false;
+                const riskDetails = result.engine_details.map(d => 
+                  `- **${d.engine}**: ${d.result}${d.detail ? ` (${d.detail})` : ''}`
+                ).join('\n');
+                
+                reportDetails.push({
+                  plugin_id: result.plugin_id,
+                  plugin_name: result.plugin_name,
+                  status: 'risk',
+                  total_engines: result.total_engines,
+                  safe_engines: result.safe_engines,
+                  unsafe_engines: result.unsafe_engines,
+                  risk_details: riskDetails,
+                  report_url: reportUrl
+                });
+              } else if (!result.enough_engines) {
+                needsReview = true;
+                allPassed = false;
+                reportDetails.push({
+                  plugin_id: result.plugin_id,
+                  plugin_name: result.plugin_name,
+                  status: 'insufficient',
+                  total_engines: result.total_engines,
+                  safe_engines: result.safe_engines,
+                  report_url: reportUrl
+                });
+              } else {
+                reportDetails.push({
+                  plugin_id: result.plugin_id,
+                  plugin_name: result.plugin_name,
+                  status: 'passed',
+                  total_engines: result.total_engines,
+                  safe_engines: result.safe_engines,
+                  report_url: reportUrl
+                });
+              }
+            }
+
+            let comment = '';
+            let setPending = false;
+
+            if (hasRisk) {
+              const riskReports = reportDetails.filter(r => r.status === 'risk');
+              const riskList = riskReports.map(r => `
+            ### 🔴 ${r.plugin_name || r.plugin_id}
+            
+            **检测到安全风险！/ Security Risk Detected!**
+            
+            - 扫描引擎总数 / Total Engines: ${r.total_engines}
+            - 安全引擎数 / Safe Engines: ${r.safe_engines}
+            - 风险引擎数 / Unsafe Engines: ${r.unsafe_engines}
+            
+            **风险详情 / Risk Details:**
+            ${r.risk_details}
+            
+            📄 [查看完整报告 / View Full Report](${r.report_url})
+            `).join('\n---\n');
+
+              comment = `## 🚫 安全检测未通过 / Security Check Failed
+            
+            此Pull Request未通过安全检测，已被自动拒绝。
+
+            This Pull Request failed the security check and has been automatically rejected.
+
+            ---
+
+            ${riskList}
+
+            ---
+
+            ⚠️ **重要提示 / Important Notice:**
+            由于检测到潜在安全风险，此Pull Request已被拒绝。请检查您的插件文件，确保不包含任何恶意代码后重新提交。
+
+            Due to detected security risks, this Pull Request has been rejected. Please verify your plugin files do not contain any malicious code and resubmit.
+            `;
+
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: 'REQUEST_CHANGES',
+                body: comment
+              });
+
+            } else if (needsReview) {
+              const reviewReports = reportDetails.filter(r => r.status === 'insufficient' || r.status === 'error');
+              const reviewList = reviewReports.map(r => {
+                if (r.status === 'error') {
+                  return `
+            ### ⚠️ ${r.plugin_id}
+            
+            **扫描异常 / Scan Error**
+            
+            ${r.message}
+            
+            📄 [查看报告 / View Report](${r.report_url})
+            `;
+                } else {
+                  return `
+            ### ⚠️ ${r.plugin_name || r.plugin_id}
+            
+            **需要人工审核 / Manual Review Required**
+            
+            - 扫描引擎总数 / Total Engines: ${r.total_engines}
+            - 安全引擎数 / Safe Engines: ${r.safe_engines}
+            
+            扫描成功的引擎数量不足${{ env.MIN_ENGINES_FOR_PASS }}个，需要人工进一步审核。
+            
+            The number of successfully scanned engines is less than ${{ env.MIN_ENGINES_FOR_PASS }}, requiring further manual review.
+            
+            📄 [查看完整报告 / View Full Report](${r.report_url})
+            `;
+                }
+              }).join('\n---\n');
+
+              comment = `## ⚠️ 需要人工审核 / Manual Review Required
+            
+            此Pull Request需要人工进一步审核。
+
+            This Pull Request requires further manual review.
+
+            ---
+
+            ${reviewList}
+
+            ---
+
+            📋 **下一步 / Next Steps:**
+            请等待仓库维护者进行人工审核。审核通过后，您的插件将被合并。
+
+            Please wait for the repository maintainers to perform a manual review. Once approved, your plugin will be merged.
+            `;
+
+              setPending = true;
+
+            } else {
+              const passReports = reportDetails.filter(r => r.status === 'passed');
+              const passList = passReports.map(r => `
+            ### ✅ ${r.plugin_name || r.plugin_id}
+            
+            - 扫描引擎总数 / Total Engines: ${r.total_engines}
+            - 安全引擎数 / Safe Engines: ${r.safe_engines}
+            
+            📄 [查看完整报告 / View Full Report](${r.report_url})
+            `).join('\n---\n');
+
+              comment = `## ✅ 安全检测通过 / Security Check Passed
+            
+            恭喜！此Pull Request已通过安全检测，等待人工审核。
+
+            Congratulations! This Pull Request has passed the security check and is awaiting manual review.
+
+            ---
+
+            ${passList}
+
+            ---
+
+            📋 **下一步 / Next Steps:**
+            请等待仓库维护者进行最终审核。审核通过后，您的插件将被合并到主分支。
+
+            Please wait for the repository maintainers to perform a final review. Once approved, your plugin will be merged into the main branch.
+            `;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+            if (setPending) {
+              core.setOutput('set_pending', 'true');
+            }
+
+            if (hasRisk) {
+              core.setOutput('has_risk', 'true');
+            }
+
+      - name: Set PR status to pending if needed
+        if: steps.scan-results.outputs.success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'Security Check',
+              description: 'Security scan requires manual review due to insufficient engines or errors',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          rm -rf ./tmp/downloads
+          echo "Temporary files cleaned up"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## PR Security Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Compliance Check:** ${{ steps.compliance-check.outputs.passed == 'true' && '✅ Passed' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.compliance-check.outputs.passed }}" == "true" ]; then
+            echo "- **File Download:** ${{ steps.download-files.outputs.success == 'true' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Sandbox Upload:** ${{ steps.upload-sandbox.outputs.success == 'true' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Security Scan:** ${{ steps.scan-results.outputs.success == 'true' && '✅ Complete' || '⚠️ Needs Review' }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All Pull Requests require manual review before merging." >> $GITHUB_STEP_SUMMARY
