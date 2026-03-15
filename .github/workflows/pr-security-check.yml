@@ -1,7 +1,7 @@
 name: PR Security Check
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - main
     paths:
@@ -21,12 +21,18 @@ env:
 jobs:
   security-check:
     runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
     steps:
-      - name: Checkout PR code
+      - name: Checkout base repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: main
+
+      - name: Fetch PR changes
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-head
+          git checkout pr-head
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,8 +47,8 @@ jobs:
         id: changed-files
         run: |
           echo "Fetching changed files..."
-          git fetch origin main
-          CHANGED_FILES=$(git diff --name-only origin/main...HEAD -- 'PluginManifests/*.yml' | tr '\n' ' ')
+          git fetch origin main:main
+          CHANGED_FILES=$(git diff --name-only main...HEAD -- 'PluginManifests/*.yml' | tr '\n' ' ')
           echo "changed_files=${CHANGED_FILES}" >> "$GITHUB_OUTPUT"
           echo "Changed files: ${CHANGED_FILES}"
 
@@ -116,8 +122,8 @@ jobs:
 
           changed_files = changed_files_str.split()
 
-          os.system('git fetch origin main 2>/dev/null')
-          os.system('git checkout origin/main -- PluginManifests/ 2>/dev/null || true')
+          os.system('git fetch origin main:main 2>/dev/null')
+          os.system('git checkout main -- PluginManifests/ 2>/dev/null || true')
           os.system('git checkout HEAD -- PluginManifests/ 2>/dev/null || true')
 
           existing_ids = set()
