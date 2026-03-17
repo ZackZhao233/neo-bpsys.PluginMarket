@@ -17,7 +17,7 @@ python scripts/build-plugin-index.py
 ```
 
 6. 只提交你修改过的 `PluginManifests/<PluginId>.yml`。
-7. 不要提交根目录 `PluginIndex.json`。
+7. **不要提交根目录 `PluginIndex.json`。**
 8. 向本仓库 `main` 分支发起 Pull Request。
 
 ## 重要警告

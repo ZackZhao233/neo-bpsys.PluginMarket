@@ -17,7 +17,7 @@ python scripts/build-plugin-index.py
 ```
 
 6. Commit only the manifest file you changed under `PluginManifests/`.
-7. Do not commit the root `PluginIndex.json`.
+7. **Do not commit the root `PluginIndex.json`.**
 8. Open a Pull Request against the `main` branch.
 
 ## Important Warning
