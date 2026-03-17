@@ -217,6 +217,20 @@ jobs:
               body: comment
             });
 
+      - name: Close PR if compliance check failed
+        if: steps.compliance-check.outputs.passed == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              state: 'closed'
+            });
+            
+            console.log('PR has been closed due to compliance check failure.');
+
       - name: Exit if compliance check failed
         if: steps.compliance-check.outputs.passed == 'false'
         run: exit 1
@@ -243,6 +257,7 @@ jobs:
               with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
                   f.write("success=true\n")
                   f.write("download_info=\n")
+                  f.write("large_files=\n")
               sys.exit(0)
 
           changed_files = changed_files_str.split()
@@ -250,7 +265,9 @@ jobs:
           os.makedirs(download_dir, exist_ok=True)
 
           download_info = []
+          large_files = []
           failed = False
+          MAX_FILE_SIZE = 100 * 1024 * 1024
 
           for file in changed_files:
               if not os.path.exists(file):
@@ -284,20 +301,34 @@ jobs:
                       )
                       
                       if result.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                          file_size = os.path.getsize(file_path)
+                          file_size_mb = file_size / (1024 * 1024)
+                          
                           sha256_hash = hashlib.sha256()
                           with open(file_path, 'rb') as f:
                               for chunk in iter(lambda: f.read(4096), b''):
                                   sha256_hash.update(chunk)
                           sha256 = sha256_hash.hexdigest()
                           
-                          download_info.append({
-                              'plugin_id': plugin_id,
-                              'plugin_name': plugin_name,
-                              'file_path': file_path,
-                              'sha256': sha256,
-                              'url': download_url
-                          })
-                          print(f"Successfully downloaded: {file_path} (SHA256: {sha256})")
+                          if file_size > MAX_FILE_SIZE:
+                              print(f"File too large: {file_path} ({file_size_mb:.2f} MB > 100 MB)")
+                              large_files.append({
+                                  'plugin_id': plugin_id,
+                                  'plugin_name': plugin_name,
+                                  'file_size_mb': round(file_size_mb, 2),
+                                  'sha256': sha256,
+                                  'url': download_url
+                              })
+                          else:
+                              download_info.append({
+                                  'plugin_id': plugin_id,
+                                  'plugin_name': plugin_name,
+                                  'file_path': file_path,
+                                  'sha256': sha256,
+                                  'url': download_url,
+                                  'file_size_mb': round(file_size_mb, 2)
+                              })
+                              print(f"Successfully downloaded: {file_path} ({file_size_mb:.2f} MB, SHA256: {sha256})")
                           break
                       else:
                           print(f"Download attempt {attempt + 1} failed for {download_url}")
@@ -327,6 +358,9 @@ jobs:
               f.write("download_info<<EOF\n")
               f.write(json.dumps(download_info) + "\n")
               f.write("EOF\n")
+              f.write("large_files<<EOF\n")
+              f.write(json.dumps(large_files) + "\n")
+              f.write("EOF\n")
 
           if failed:
               sys.exit(1)
@@ -334,8 +368,62 @@ jobs:
         env:
           CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
 
+      - name: Post comment for large files
+        if: steps.download-files.outputs.large_files != '' && steps.download-files.outputs.large_files != '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const largeFilesStr = `${{ steps.download-files.outputs.large_files }}`;
+            let largeFiles = [];
+            try {
+              largeFiles = JSON.parse(largeFilesStr || '[]');
+            } catch (e) {
+              console.log('Failed to parse large files data');
+            }
+            
+            if (largeFiles.length > 0) {
+              const fileList = largeFiles.map(f => `
+            ### 📦 ${f.plugin_name || f.plugin_id}
+            
+            - **文件大小 / File Size:** ${f.file_size_mb} MB
+            - **SHA256:** \`${f.sha256}\`
+            - **下载链接 / Download URL:** ${f.url}
+            `).join('\n---\n');
+              
+              const comment = `## ⚠️ 文件过大需人工审核 / Large File Requires Manual Review
+            
+            以下插件文件超过100MB，无法通过自动化安全扫描，需要人工审核：
+
+            The following plugin files exceed 100MB and cannot be scanned automatically. Manual review is required.
+
+            ---
+
+            ${fileList}
+
+            ---
+
+            📋 **说明 / Notes:**
+            - 微步云沙箱API限制文件大小为100MB
+            - 文件已成功下载并计算SHA256哈希值
+            - 请等待仓库维护者进行人工审核
+
+            - ThreatBook Sandbox API has a file size limit of 100MB
+            - Files have been downloaded and SHA256 hashes have been calculated
+            - Please wait for repository maintainers to perform a manual review
+            `;
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+              
+              console.log(`Posted comment for ${largeFiles.length} large file(s)`);
+            }
+
       - name: Upload files to ThreatBook Sandbox
-        if: steps.download-files.outputs.success == 'true'
+        if: steps.download-files.outputs.success == 'true' && (steps.download-files.outputs.download_info != '' && steps.download-files.outputs.download_info != '[]')
         id: upload-sandbox
         run: |
           python3 << 'PYTHON_SCRIPT'
@@ -703,6 +791,15 @@ jobs:
                 event: 'REQUEST_CHANGES',
                 body: comment
               });
+              
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                state: 'closed'
+              });
+              
+              console.log('PR has been closed due to security risk detected.');
 
             } else if (needsReview) {
               const reviewReports = reportDetails.filter(r => r.status === 'insufficient' || r.status === 'error');
