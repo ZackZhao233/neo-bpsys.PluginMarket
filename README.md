@@ -10,7 +10,8 @@
 2. 在你自己的仓库中修改或新增 `PluginManifests/<PluginId>.yml`。
 3. 确保清单中的 `id` 唯一，且更新插件时不要修改已有 `id`。
 4. 补齐或更新插件信息，例如 `name`、`description`、`version`、`apiVersion`、`author`、`icon`、`readme`、`url`、`downloadURL`。
-5. 如需本地自检，可执行：
+5. **不要填写 `sha256`。** SHA-256 由仓库自动校验流程生成并写入 release 状态存储。
+6. 如需本地自检，可执行：
 
 ```powershell
 python scripts/build-plugin-index.py
@@ -18,12 +19,16 @@ python scripts/build-plugin-index.py
 
 6. 只提交你修改过的 `PluginManifests/<PluginId>.yml`。
 7. **不要提交根目录 `PluginIndex.json`。**
-8. 向本仓库 `main` 分支发起 Pull Request。
+8. **不要提交或手动维护 `checksums.json`。**
+9. 向本仓库 `main` 分支发起 Pull Request。
 
 ## 重要警告
 
 - `PluginIndex.json` 是自动生成文件，由 GitHub Actions 在合并后自动重建并提交。
+- `sha256` 不由插件作者填写。正式 checksum 状态保存在固定 release 的 `checksums.json` asset 中。
+- 小文件在自动校验通过后会直接写入 checksum；大文件可能进入人工处理流程。
 - 插件开发者提交 PR 时，不需要也不应该手动修改 `PluginIndex.json`。
+- 插件开发者提交 PR 时，不需要也不应该手动维护 `checksums.json`。
 - 如果 PR 中包含手动修改的 `PluginIndex.json`，初审 Action 会直接失败，此类变更不予合并。
 
 ## 清单要求
@@ -48,6 +53,7 @@ python scripts/build-plugin-index.py
 | `readme` |  | 插件说明文档 URL | `https://.../README.md` |
 | `url` |  | 插件项目主页 URL | `https://github.com/...` |
 | `downloadURL` | ✅ | 插件包下载地址 | `https://github.com/.../repo-v0.04.zip` |
+| `sha256` | ❌ | **不要填写**。由系统在校验/人工处理后自动写入发布状态并注入 `PluginIndex.json` | |
 
 示例：
 
@@ -83,17 +89,26 @@ downloadURL: "https://github.com/jefcrb/3DViewerIDV/releases/download/v0.04/repo
 
 当 PR 提交到 `main` 时，GitHub Actions 会先进行初审：
 
-1. 检查是否手动修改了 `PluginIndex.json`。
-2. 校验变更的 `PluginManifests/**/*.yml` 是否符合规范。
-3. 尝试重建根目录 `PluginIndex.json`，确认清单可以正常生成索引。
+1. 检查 PR 是否只修改了一个 `PluginManifests/<PluginId>.yml`。
+2. 拒绝手动修改 `PluginIndex.json` 或 `checksums.json`。
+3. 校验 manifest 的扁平结构、必填字段、文件名与 `id` 一致性，以及同插件 open PR 冲突。
+4. 下载插件包并计算 SHA-256。
+5. 小文件走自动校验，校验通过后立即把 checksum 写入 release asset `checksums.json`。
+6. 大文件会被标记为人工处理，等待管理员手动 workflow 写入 checksum。
 
 如果 PR 通过并合并到 `main`，GitHub Actions 会继续自动：
 
 1. 扫描全部插件清单。
-2. 重建根目录 `PluginIndex.json`。
-3. 仅在索引内容发生变化时自动提交并推回仓库。
+2. 从 release asset `checksums.json` 读取正式 checksum 状态。
+3. 重建根目录 `PluginIndex.json`，并为每个插件条目追加 `sha256`。
+4. 仅在索引内容发生变化时自动提交并推回仓库。
 
 生成后的 `PluginIndex.json` 使用插件 `id` 作为顶层 key。
+
+管理员还可以手动触发 `backfill-missing-checksums` workflow，用于：
+
+1. 为当前 `main` 分支里已存在、但 release `checksums.json` 中缺失 checksum 的插件补齐 hash。
+2. 对大文件 PR 完成人工处理后，按 PR 编号写入对应 checksum，并自动补上 `manual-review-approved` / `ci:verified` 标签。
 
 ## 校验规则
 

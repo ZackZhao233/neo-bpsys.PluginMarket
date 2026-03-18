@@ -1,90 +1,65 @@
 from __future__ import annotations
 
-import json
+import argparse
 import sys
-from pathlib import Path
 
+from plugin_market.checksum_store import GitHubReleaseChecksumStore
+from plugin_market.common import PLUGIN_INDEX_PATH, PluginMarketError, load_json_file, write_json_file
+from plugin_market.index_builder import build_plugin_index
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-MANIFEST_DIR = REPO_ROOT / "PluginManifests"
-OUTPUT_PATH = REPO_ROOT / "PluginIndex.json"
+def load_checksums(args: argparse.Namespace) -> dict[str, str] | None:
+    if args.checksums_file:
+        data = load_json_file(args.checksums_file)
+        if not isinstance(data, dict):
+            raise PluginMarketError(f"Checksum file must contain a JSON object: {args.checksums_file}")
+        return {str(key): str(value) for key, value in data.items()}
 
+    if args.load_checksums_from_release:
+        store = GitHubReleaseChecksumStore(
+            repo=args.repo,
+            token=args.token,
+            release_tag=args.release_tag,
+            asset_name=args.asset_name,
+        )
+        return store.load_checksums()
 
-def parse_scalar(raw_value: str) -> str:
-    value = raw_value.strip()
-    if not value:
-        return ""
-
-    if value.startswith('"') and value.endswith('"'):
-        return json.loads(value)
-
-    if value.startswith("'") and value.endswith("'"):
-        return value[1:-1].replace("''", "'")
-
-    return value
-
-
-def parse_manifest(path: Path) -> dict[str, str]:
-    manifest: dict[str, str] = {}
-
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        if raw_line[:1].isspace():
-            raise ValueError(f"{path}: line {line_number} uses indentation; only flat key/value manifests are supported")
-
-        key, separator, value = raw_line.partition(":")
-        if not separator:
-            raise ValueError(f"{path}: line {line_number} is not a valid key/value pair")
-
-        key = key.strip()
-        if not key:
-            raise ValueError(f"{path}: line {line_number} has an empty key")
-        if key in manifest:
-            raise ValueError(f"{path}: duplicate key '{key}'")
-
-        manifest[key] = parse_scalar(value)
-
-    if "id" not in manifest or not manifest["id"]:
-        raise ValueError(f"{path}: missing required 'id'")
-
-    return manifest
-
-
-def build_index() -> dict[str, dict[str, str]]:
-    if not MANIFEST_DIR.exists():
-        raise ValueError(f"Manifest directory not found: {MANIFEST_DIR}")
-
-    manifests = sorted(MANIFEST_DIR.rglob("*.yml"))
-    plugin_index: dict[str, dict[str, str]] = {}
-
-    for manifest_path in manifests:
-        manifest = parse_manifest(manifest_path)
-        plugin_id = manifest["id"]
-        if plugin_id in plugin_index:
-            raise ValueError(
-                f"Duplicate plugin id '{plugin_id}' found in "
-                f"'{manifest_path}' and another manifest"
-            )
-        plugin_index[plugin_id] = manifest
-
-    return {plugin_id: plugin_index[plugin_id] for plugin_id in sorted(plugin_index)}
+    return None
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Build PluginIndex.json from PluginManifests.")
+    parser.add_argument("--checksums-file", type=str)
+    parser.add_argument("--load-checksums-from-release", action="store_true")
+    parser.add_argument("--strict-checksums", action="store_true")
+    parser.add_argument("--repo")
+    parser.add_argument("--token")
+    parser.add_argument("--release-tag")
+    parser.add_argument("--asset-name")
+    args = parser.parse_args()
+
     try:
-        plugin_index = build_index()
-        OUTPUT_PATH.write_text(
-            json.dumps(plugin_index, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        checksums = load_checksums(args)
+        if args.strict_checksums and checksums is None:
+            raise PluginMarketError(
+                "Strict checksum mode requires either --checksums-file or --load-checksums-from-release."
+            )
+
+        plugin_index, missing_checksums = build_plugin_index(
+            checksums=checksums,
+            strict_checksums=args.strict_checksums,
         )
+        write_json_file(PLUGIN_INDEX_PATH, plugin_index)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    print(f"Wrote {OUTPUT_PATH}")
+    if missing_checksums:
+        print(
+            f"Skipped sha256 for plugins missing release state: {', '.join(missing_checksums)}",
+            file=sys.stderr,
+        )
+
+    print(f"Wrote {PLUGIN_INDEX_PATH}")
     return 0
 
 

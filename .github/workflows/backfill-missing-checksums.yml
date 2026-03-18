@@ -1,0 +1,93 @@
+name: backfill-missing-checksums
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number for manual large-package processing"
+        required: false
+        type: string
+      plugin_id:
+        description: "Optional plugin id filter"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  PLUGIN_MARKET_STATE_RELEASE_TAG: market-state
+  PLUGIN_MARKET_STATE_ASSET_NAME: checksums.json
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: plugin-market-state
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Ensure repository labels exist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              ['ci:precheck-failed', 'B42318'],
+              ['ci:waiting-sandbox', 'FBCA04'],
+              ['ci:manual-review-required', 'D97706'],
+              ['ci:verified', '1A7F37'],
+              ['ci:plugin-conflict', '5319E7'],
+              ['manual-review-approved', '0E8A16']
+            ];
+            for (const [name, color] of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color
+                });
+              }
+            }
+
+      - name: Run checksum backfill or manual PR processing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ARGS=(
+            --repo "${{ github.repository }}"
+            --token "${{ github.token }}"
+            --release-tag "${{ env.PLUGIN_MARKET_STATE_RELEASE_TAG }}"
+            --asset-name "${{ env.PLUGIN_MARKET_STATE_ASSET_NAME }}"
+          )
+
+          if [ -n "${{ inputs.plugin_id }}" ]; then
+            ARGS+=(--plugin-id "${{ inputs.plugin_id }}")
+          fi
+
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            ARGS+=(--pr-number "${{ inputs.pr_number }}")
+          fi
+
+          python3 scripts/plugin-market-backfill-checksums.py "${ARGS[@]}"

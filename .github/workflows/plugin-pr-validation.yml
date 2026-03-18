@@ -1,0 +1,402 @@
+name: Plugin PR Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  PLUGIN_MARKET_STATE_RELEASE_TAG: market-state
+  PLUGIN_MARKET_STATE_ASSET_NAME: checksums.json
+  PLUGIN_MARKET_MAX_AUTOVERIFY_SIZE_BYTES: "104857600"
+  PLUGIN_MARKET_SANDBOX_TIMEOUT_SECONDS: "600"
+  PLUGIN_MARKET_MIN_ENGINES_FOR_PASS: "20"
+  PLUGIN_MARKET_SANDBOX_RUNTIME_SECONDS: "280"
+
+jobs:
+  precheck:
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      plugin_id: ${{ steps.run_precheck.outputs.plugin_id }}
+      manifest_path: ${{ steps.run_precheck.outputs.manifest_path }}
+      download_url: ${{ steps.run_precheck.outputs.download_url }}
+
+    steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch pull request head
+        run: |
+          git fetch --no-tags origin pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr/${{ github.event.pull_request.number }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Ensure repository labels exist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              ['ci:precheck-failed', 'B42318'],
+              ['ci:waiting-sandbox', 'FBCA04'],
+              ['ci:manual-review-required', 'D97706'],
+              ['ci:verified', '1A7F37'],
+              ['ci:plugin-conflict', '5319E7'],
+              ['manual-review-approved', '0E8A16']
+            ];
+            for (const [name, color] of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color
+                });
+              }
+            }
+
+      - name: Run manifest precheck
+        id: run_precheck
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/plugin-market-precheck.py \
+            --base-ref "${{ github.event.pull_request.base.sha }}" \
+            --head-ref "refs/remotes/origin/pr/${{ github.event.pull_request.number }}" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --token "${{ github.token }}"
+
+      - name: Update precheck labels
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PRECHECK_OUTCOME: ${{ steps.run_precheck.outcome }}
+          FAILURE_REASON: ${{ steps.run_precheck.outputs.failure_reason }}
+          PR_ACTION: ${{ github.event.action }}
+        with:
+          script: |
+            const issueNumber = context.payload.pull_request.number;
+            const success = process.env.PRECHECK_OUTCOME === 'success';
+            const reason = process.env.FAILURE_REASON || '';
+            const action = process.env.PR_ACTION || '';
+
+            const removeLabels = [
+              'ci:precheck-failed',
+              'ci:plugin-conflict',
+              'ci:waiting-sandbox',
+              'ci:manual-review-required',
+              'ci:verified'
+            ];
+            if (['opened', 'reopened', 'synchronize'].includes(action)) {
+              removeLabels.push('manual-review-approved');
+            }
+
+            for (const label of removeLabels) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+            if (success) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['ci:waiting-sandbox']
+              });
+              return;
+            }
+
+            const failureLabel = reason === 'plugin-conflict' ? 'ci:plugin-conflict' : 'ci:precheck-failed';
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: [failureLabel]
+            });
+
+      - name: Fail precheck job
+        if: steps.run_precheck.outcome != 'success'
+        run: |
+          echo "${{ steps.run_precheck.outputs.error_message }}"
+          exit 1
+
+  package_check:
+    runs-on: ubuntu-latest
+    needs: precheck
+    if: |
+      needs.precheck.result == 'success' &&
+      (
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
+      )
+    concurrency:
+      group: plugin-market-state
+      cancel-in-progress: false
+    outputs:
+      status: ${{ steps.run_package.outputs.status }}
+      needs_manual_review: ${{ steps.run_package.outputs.needs_manual_review }}
+      checksum_present: ${{ steps.run_package.outputs.checksum_present }}
+      checksum_matches: ${{ steps.run_package.outputs.checksum_matches }}
+      sha256: ${{ steps.run_package.outputs.sha256 }}
+
+    steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch pull request head
+        run: |
+          git fetch --no-tags origin pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr/${{ github.event.pull_request.number }}
+
+      - name: Materialize PR manifest
+        run: |
+          mkdir -p "$(dirname "${{ needs.precheck.outputs.manifest_path }}")"
+          git show "refs/remotes/origin/pr/${{ github.event.pull_request.number }}:${{ needs.precheck.outputs.manifest_path }}" > "${{ needs.precheck.outputs.manifest_path }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run package verification
+        id: run_package
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          THREAT_BOOK_API_KEY: ${{ secrets.THREAT_BOOK_API_KEY }}
+        run: |
+          python3 scripts/plugin-market-package-check.py \
+            --manifest-path "${{ needs.precheck.outputs.manifest_path }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --repo "${{ github.repository }}" \
+            --token "${{ github.token }}" \
+            --release-tag "${{ env.PLUGIN_MARKET_STATE_RELEASE_TAG }}" \
+            --asset-name "${{ env.PLUGIN_MARKET_STATE_ASSET_NAME }}" \
+            --max-auto-verify-size "${{ env.PLUGIN_MARKET_MAX_AUTOVERIFY_SIZE_BYTES }}" \
+            --sandbox-timeout "${{ env.PLUGIN_MARKET_SANDBOX_TIMEOUT_SECONDS }}" \
+            --min-engines-for-pass "${{ env.PLUGIN_MARKET_MIN_ENGINES_FOR_PASS }}" \
+            --sandbox-runtime "${{ env.PLUGIN_MARKET_SANDBOX_RUNTIME_SECONDS }}"
+
+      - name: Upload verified result artifact
+        if: steps.run_package.outputs.verified_result_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-result
+          path: ${{ steps.run_package.outputs.verified_result_path }}
+          if-no-files-found: error
+
+      - name: Update package labels
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PACKAGE_OUTCOME: ${{ steps.run_package.outcome }}
+          PACKAGE_STATUS: ${{ steps.run_package.outputs.status }}
+        with:
+          script: |
+            const issueNumber = context.payload.pull_request.number;
+            const outcome = process.env.PACKAGE_OUTCOME || '';
+            const status = process.env.PACKAGE_STATUS || '';
+
+            const removeLabels = ['ci:waiting-sandbox', 'ci:manual-review-required', 'ci:verified'];
+            for (const label of removeLabels) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: label
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+            if (outcome !== 'success') {
+              return;
+            }
+
+            if (status === 'verified' || status === 'manual-review-complete') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['ci:verified']
+              });
+              return;
+            }
+
+            if (status === 'manual-review-required') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: ['ci:manual-review-required']
+              });
+            }
+
+      - name: Comment when manual review is required
+        if: steps.run_package.outputs.status == 'manual-review-required'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- plugin-market-manual-review -->';
+            const issueNumber = context.payload.pull_request.number;
+            const sha256 = `${{ steps.run_package.outputs.sha256 }}`;
+            const manifestPath = `${{ needs.precheck.outputs.manifest_path }}`;
+            const pluginId = `${{ needs.precheck.outputs.plugin_id }}`;
+            const fileSizeMb = `${{ steps.run_package.outputs.file_size_mb }}`;
+            const body = `${marker}
+            大文件插件包已计算 SHA-256，但未自动写入正式 checksum 状态。
+
+            - Plugin: \`${pluginId}\`
+            - Manifest: \`${manifestPath}\`
+            - SHA-256: \`${sha256}\`
+            - File size: ${fileSizeMb} MiB
+
+            下一步：
+            1. 管理员完成人工审核。
+            2. 管理员手动触发 \`backfill-missing-checksums\` workflow，并填写当前 PR 编号。
+            3. workflow 会把 checksum 写入 release asset，并补上 \`manual-review-approved\` / \`ci:verified\` 标签。
+            4. 本 PR 的 \`plugin-pr-gate\` 会在重新运行后放行。`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100
+            });
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' && comment.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body
+              });
+            }
+
+      - name: Fail package job
+        if: steps.run_package.outcome != 'success'
+        run: |
+          echo "${{ steps.run_package.outputs.error_message }}"
+          exit 1
+
+  plugin-pr-gate:
+    name: plugin-pr-gate
+    runs-on: ubuntu-latest
+    needs:
+      - precheck
+      - package_check
+    if: |
+      always() &&
+      (
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
+      )
+    steps:
+      - name: Evaluate merge gate
+        uses: actions/github-script@v7
+        env:
+          PRECHECK_RESULT: ${{ needs.precheck.result }}
+          PACKAGE_RESULT: ${{ needs.package_check.result }}
+          PACKAGE_STATUS: ${{ needs.package_check.outputs.status }}
+          NEEDS_MANUAL_REVIEW: ${{ needs.package_check.outputs.needs_manual_review }}
+          CHECKSUM_PRESENT: ${{ needs.package_check.outputs.checksum_present }}
+          CHECKSUM_MATCHES: ${{ needs.package_check.outputs.checksum_matches }}
+        with:
+          script: |
+            const precheckResult = process.env.PRECHECK_RESULT;
+            const packageResult = process.env.PACKAGE_RESULT;
+            const packageStatus = process.env.PACKAGE_STATUS || '';
+            const needsManualReview = process.env.NEEDS_MANUAL_REVIEW === 'true';
+            const checksumPresent = process.env.CHECKSUM_PRESENT === 'true';
+            const checksumMatches = process.env.CHECKSUM_MATCHES === 'true';
+
+            if (precheckResult !== 'success') {
+              core.setFailed('precheck failed');
+              return;
+            }
+
+            if (packageResult !== 'success') {
+              core.setFailed('package_check failed');
+              return;
+            }
+
+            const labels = (context.payload.pull_request.labels || []).map(label => label.name);
+            if (!needsManualReview) {
+              if (packageStatus !== 'verified') {
+                core.setFailed(`automatic package verification did not finish successfully (status: ${packageStatus || 'unknown'})`);
+                return;
+              }
+              return;
+            }
+
+            if (!labels.includes('manual-review-approved')) {
+              core.setFailed('large package still requires the manual-review-approved label');
+              return;
+            }
+
+            if (!checksumPresent || !checksumMatches) {
+              core.setFailed('manual-review workflow has not written the matching checksum into release state yet');
+            }
