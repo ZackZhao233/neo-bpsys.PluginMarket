@@ -12,19 +12,6 @@
     "downloadURL": "https://github.com/jefcrb/3DViewerIDV/releases/download/v0.07.1/3DViewerIDV-v0.07.1.zip",
     "sha256": "2fcef2e02cb87f8e7ae54ea3ddef532185a5289dff55cc069f4b74adb88f46a4"
   },
-  "CoopBpPlugin": {
-    "id": "CoopBpPlugin",
-    "name": "CoopBpPlugin",
-    "description": "合作BP插件",
-    "version": "0.0.2.0",
-    "apiVersion": "2.0.0.0",
-    "author": "RenjiNotBot",
-    "icon": "https://docs.bpsys.plfjy.top/logo.png",
-    "readme": "https://github.com/ZackZhao233/neo-bpsys-wpf.CoopBpPlugin/blob/main/README.md",
-    "url": "https://github.com/ZackZhao233/neo-bpsys-wpf.CoopBpPlugin/",
-    "downloadURL": "https://github.com/ZackZhao233/neo-bpsys-wpf.CoopBpPlugin/releases/download/DO-NOT-DOWNLOAD!!!!!/DoNotDownload.zip",
-    "sha256": "SKIP"
-  },
   "plfjy.ExamplePlugin": {
     "id": "plfjy.ExamplePlugin",
     "name": "示例插件（仅限插件开发者学习使用）",
